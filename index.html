@@ -1,0 +1,243 @@
+// ==========================================
+// BACKEND Google Apps Script - DataPulse Suite
+// ==========================================
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.tryLock(10000);
+  
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var action = data.action;
+    var result = {};
+
+    // Inicializar la estructura base del libro si no existe
+    inicializarBaseDeDatos();
+
+    switch(action) {
+      case 'login':
+        result = procesarLogin(data);
+        break;
+      case 'obtenerDatosDashboard':
+        result = obtenerDatosDashboard();
+        break;
+      case 'guardarOrganizacion':
+        result = guardarOrganizacion(data.orgData);
+        break;
+      case 'crearProducto':
+        result = crearProducto(data.producto);
+        break;
+      case 'crearVendedor':
+        result = crearVendedor(data.vendedor);
+        break;
+      case 'registrarVenta':
+        result = registrarVenta(data.venta);
+        break;
+      case 'guardarObjetivo':
+        result = guardarObjetivo(data.objetivo);
+        break;
+      case 'actualizarAvanceOKR':
+        result = actualizarAvanceOKR(data.idObjetivo, data.nuevoActual);
+        break;
+      case 'guardarConfig':
+        result = guardarConfig(data.mistralKey);
+        break;
+      default:
+        result = { success: false, error: "Acción no reconocida." };
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({ success: true, data: result }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({ success: false, error: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --------------------------------------------------
+// FUNCIONES AUXILIARES Y OPERACIONALES
+// --------------------------------------------------
+
+function inicializarBaseDeDatos() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var hojas = ['Organizacion', 'Productos', 'Vendedores', 'Ventas', 'Objetivos', 'Config'];
+  
+  hojas.forEach(function(nombre) {
+    if (!ss.getSheetByName(nombre)) {
+      var sheet = ss.insertSheet(nombre);
+      if (nombre === 'Organizacion') sheet.appendRow(['Empresa', 'NIT', 'Tamaño', 'Sector', 'DOFA_JSON', 'PESTEL_JSON']);
+      if (nombre === 'Productos') sheet.appendRow(['ID', 'Nombre', 'StockInicial', 'Precio']);
+      if (nombre === 'Vendedores') sheet.appendRow(['ID', 'Nombre', 'Zona']);
+      if (nombre === 'Ventas') sheet.appendRow(['ID', 'Fecha', 'Producto', 'Cantidad', 'Monto', 'Vendedor', 'Ubicacion']);
+      if (nombre === 'Objetivos') sheet.appendRow(['ID', 'Objetivo', 'Descripcion', 'Meta', 'Actual']);
+      if (nombre === 'Config') sheet.appendRow(['Clave', 'Valor']);
+    }
+  });
+}
+
+function procesarLogin(data) {
+  var org = obtenerDatosHoja('Organizacion');
+  var esNuevo = org.length === 0;
+  return {
+    idUsuario: data.idUsuario || "USR-01",
+    esNuevo: esNuevo,
+    organizacion: esNuevo ? {} : MapearOrganizacion(org[0])
+  };
+}
+
+function obtenerDatosDashboard() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  var ventas = obtenerDatosHoja('Ventas');
+  var productos = obtenerDatosHoja('Productos');
+  var vendedores = obtenerDatosHoja('Vendedores');
+  var objetivos = obtenerDatosHoja('Objetivos');
+  var orgRaw = obtenerDatosHoja('Organizacion');
+  var configRaw = obtenerDatosHoja('Config');
+
+  // Calcular unidades vendidas por producto
+  var productosProcesados = productos.map(function(p) {
+    var vendidos = ventas.reduce(function(acc, v) {
+      return (v.Producto === p.Nombre) ? acc + Number(v.Cantidad || 1) : acc;
+    }, 0);
+    return {
+      nombre: p.Nombre,
+      stockInicial: Number(p.StockInicial || 0),
+      vendidos: vendidos,
+      precio: Number(p.Precio || 0)
+    };
+  });
+
+  var mistralKey = "";
+  configRaw.forEach(function(c) { if (c.Clave === 'MISTRAL_KEY') mistralKey = c.Valor; });
+
+  return {
+    ventas: ventas.map(function(v) {
+      return {
+        id: v.ID,
+        fecha: v.Fecha,
+        producto: v.Producto,
+        cantidad: Number(v.Cantidad),
+        monto: Number(v.Monto),
+        vendedor: v.Vendedor,
+        ubicacion: v.Ubicacion
+      };
+    }),
+    productos: productosProcesados,
+    vendedores: vendedores.map(function(v) { return { nombre: v.Nombre, zona: v.Zona }; }),
+    objetivos: objetivos.map(function(o) {
+      return {
+        id: o.ID,
+        objetivo: o.Objetivo,
+        descripcion: o.Descripcion,
+        meta: Number(o.Meta),
+        actual: Number(o.Actual)
+      };
+    }),
+    organizacion: orgRaw.length > 0 ? MapearOrganizacion(orgRaw[0]) : {},
+    mistralKey: mistralKey
+  };
+}
+
+function MapearOrganizacion(row) {
+  return {
+    nombreEmpresa: row.Empresa,
+    nit: row.NIT,
+    tamaño: row.Tamaño,
+    sector: row.Sector,
+    dofa: row.DOFA_JSON ? JSON.parse(row.DOFA_JSON) : {},
+    pestel: row.PESTEL_JSON ? JSON.parse(row.PESTEL_JSON) : {}
+  };
+}
+
+function guardarOrganizacion(orgData) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Organizacion');
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) sheet.deleteRow(lastRow); // Mantener un solo registro corporativo
+  
+  sheet.appendRow([
+    orgData.nombreEmpresa,
+    orgData.nit,
+    orgData.tamaño || "",
+    orgData.sector || "",
+    JSON.stringify(orgData.dofa || {}),
+    JSON.stringify(orgData.pestel || {})
+  ]);
+  return { nombreEmpresa: orgData.nombreEmpresa };
+}
+
+function crearProducto(p) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Productos');
+  var id = "PROD-" + (sheet.getLastRow());
+  sheet.appendRow([id, p.nombre, p.stockInicial, p.precio]);
+  return { id: id };
+}
+
+function crearVendedor(v) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Vendedores');
+  var id = "VEND-" + (sheet.getLastRow());
+  sheet.appendRow([id, v.nombre, v.zona]);
+  return { id: id };
+}
+
+function registrarVenta(v) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Ventas');
+  var id = "VENTA-" + (sheet.getLastRow());
+  sheet.appendRow([id, v.fecha, v.producto, v.cantidad, v.monto, v.vendedor, v.ubicacion]);
+  return { id: id };
+}
+
+function guardarObjetivo(o) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Objetivos');
+  var id = "OKR-" + (sheet.getLastRow());
+  sheet.appendRow([id, o.objetivo, o.descripcion, o.meta, o.actual || 0]);
+  return { id: id };
+}
+
+function actualizarAvanceOKR(idObjetivo, nuevoActual) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Objetivos');
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === idObjetivo) {
+      sheet.getRange(i + 1, 5).setValue(nuevoActual);
+      return { id: idObjetivo, actual: nuevoActual };
+    }
+  }
+  return { updated: false };
+}
+
+function guardarConfig(mistralKey) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Config');
+  var data = sheet.getDataRange().getValues();
+  var encontrado = false;
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === 'MISTRAL_KEY') {
+      sheet.getRange(i + 1, 2).setValue(mistralKey);
+      encontrado = true;
+      break;
+    }
+  }
+  if (!encontrado) sheet.appendRow(['MISTRAL_KEY', mistralKey]);
+  return { success: true };
+}
+
+function obtenerDatosHoja(nombreHoja) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(nombreHoja);
+  if (!sheet) return [];
+  var rows = sheet.getDataRange().getValues();
+  if (rows.length <= 1) return [];
+  
+  var headers = rows[0];
+  var result = [];
+  for (var i = 1; i < rows.length; i++) {
+    var obj = {};
+    for (var j = 0; j < headers.length; j++) {
+      obj[headers[j]] = rows[i][j];
+    }
+    result.push(obj);
+  }
+  return result;
+}
